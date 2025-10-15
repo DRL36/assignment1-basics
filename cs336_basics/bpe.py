@@ -4,15 +4,16 @@ BPE (Byte Pair Encoding) tokenizer training implementation.
 
 import regex as re 
 import os
+import json
 from collections import defaultdict, Counter
-from typing import BinaryIO
+from typing import Iterable
 from .pretokenization_example import find_chunk_boundaries
 from multiprocessing import Pool
 
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 def process_chunk(args):
     """Process a single chunk and return token counts."""
     input_path, start, end, special_tokens = args
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     
     with open(input_path, 'rb') as f:
         f.seek(start)
@@ -216,13 +217,105 @@ class BPETokenizer:
         for i, (first, second) in enumerate(merges):
             self.merge_rules[(first, second)] = first + second
     
+    
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] = None):
+        with open(vocab_filepath) as vocab_f:
+            vocab = json.load(vocab_f)
+        merges = []
+        with open(merges_filepath) as f:
+            for line in f:
+                cleaned_line = line.rstrip()
+                if cleaned_line and len(cleaned_line.split(" ")) == 2:
+                    merges.append(tuple(cleaned_line.split(" ")))
+        return BPETokenizer(vocab, merges, special_tokens)
+    
+    def _encode_pre_token(self, token: str) -> list[int]:
+        token_bytes = token.encode('utf-8')
+        if token in self.special_tokens:
+            return [self.byte_to_id[token_bytes]]
+        
+        token_bytes_split = [bytes([b]) for b in token_bytes]
+        if len(token_bytes_split) == 1:
+            return [self.byte_to_id[token_bytes_split[0]]]
+        
+        while True:
+            possible_merges = []
+            for i in range(len(token_bytes_split) - 1):
+                pair = (token_bytes_split[i], token_bytes_split[i + 1])
+                if pair in self.merge_rules:
+                    priority = self.merges.index(pair)
+                    possible_merges.append((priority, i, pair))
+            
+            if not possible_merges:
+                break
+            
+            possible_merges.sort(key=lambda x: x[0])
+            priority, pos, best_pair = possible_merges[0]
+            
+            merged_bytes = self.merge_rules[best_pair]
+            token_bytes_split = (token_bytes_split[:pos] + 
+                               [merged_bytes] + 
+                               token_bytes_split[pos + 2:])
+        
+        ans = []
+        for byte_obj in token_bytes_split:
+            ans.append(self.byte_to_id[byte_obj])
+        return ans
+    
     def encode(self, text: str) -> list[int]:
         """Encode text to token IDs."""
-        # This is a simplified implementation
-        # In practice, you'd need to handle the full GPT-2 tokenization process
-        raise NotImplementedError("Encoding not implemented in skeleton")
+        if self.special_tokens:
+            sorted_special_tokens = sorted(self.special_tokens, key=len, reverse=True)
+            special_pattern = "|".join(re.escape(token) for token in sorted_special_tokens)
+            segments = re.split(f"({special_pattern})", text)
+        else:
+            segments = [text]
+        
+        ans = []
+        for segment in segments:
+            if segment in self.special_tokens:
+                token_ids = self._encode_pre_token(segment)
+                ans.extend(token_ids)
+            elif segment:
+                pre_tokens = re.findall(PAT, segment)
+                for token in pre_tokens:
+                    token_ids = self._encode_pre_token(token)
+                    ans.extend(token_ids)
+        return ans
     
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
+        # Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs. This is required for memory-eﬀicient tokenization of large files that we cannot directly load into memory.
+        buffer = ""
+        if self.special_tokens:
+            special_pattern = "|".join(re.escape(token) for token in self.special_tokens)
+            combined_pattern = f"({special_pattern})|({PAT})"
+        else:
+            combined_pattern = PAT
+    
+        for chunk in iterable:
+            buffer += chunk
+            matches = list(re.finditer(combined_pattern, buffer))
+            if len(matches) > 1:
+                # Keep last match in buffer (might be incomplete)
+                # Process all but the last match
+                last_complete_end = matches[-2].end()
+                complete_portion = buffer[:last_complete_end]
+                buffer = buffer[last_complete_end:]
+                
+                if complete_portion:
+                    token_ids = self.encode(complete_portion)
+                    for token_id in token_ids:
+                        yield token_id
+        # Process remaining buffer
+        if buffer:
+            token_ids = self.encode(buffer)
+            for token_id in token_ids:
+                yield token_id
+        
+        
     def decode(self, token_ids: list[int]) -> str:
         """Decode token IDs back to text."""
-        # This is a simplified implementation
-        raise NotImplementedError("Decoding not implemented in skeleton")
+        all_bytes = b""
+        for token_id in token_ids:
+            all_bytes += self.vocab[token_id]
+        return all_bytes.decode('utf-8', errors='replace')
